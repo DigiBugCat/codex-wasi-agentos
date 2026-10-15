@@ -1,0 +1,48 @@
+From 3e66c2b6117daaf82cdf4a8f1a04f8d246e2cb09 Mon Sep 17 00:00:00 2001
+From: agentos-lab <lab@local>
+Date: Thu, 15 Oct 2026 01:07:35 -0700
+Subject: [PATCH 8/9] session-turn: auto-answer request_user_input /
+ request_permissions so turns never block
+
+---
+ codex-rs/exec/src/session_turn_wasi.rs | 27 ++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/codex-rs/exec/src/session_turn_wasi.rs b/codex-rs/exec/src/session_turn_wasi.rs
+index 5479009b12..017ad14e5d 100644
+--- a/codex-rs/exec/src/session_turn_wasi.rs
++++ b/codex-rs/exec/src/session_turn_wasi.rs
+@@ -440,6 +440,33 @@ async fn session_turn() -> anyhow::Result<()> {
+                     "locations": e.changes.keys().map(|path| json!({ "path": path })).collect::<Vec<_>>(),
+                 }));
+             }
++            // The agentOS protocol has no user-question round trip. Answer at once so the
++            // turn never blocks: no answers (the model proceeds on its own judgment) and no
++            // extra permissions (the VM is the sandbox; commands already run in it).
++            EventMsg::RequestUserInput(e) => {
++                emit(json!({
++                    "type": "reasoning_delta",
++                    "delta": format!("[agentOS] request_user_input auto-answered (no answers): {} question(s)", e.questions.len()),
++                }));
++                let _ = thread
++                    .submit(Op::UserInputAnswer {
++                        id: e.turn_id,
++                        response: codex_protocol::request_user_input::RequestUserInputResponse {
++                            answers: HashMap::new(),
++                        },
++                    })
++                    .await;
++            }
++            EventMsg::RequestPermissions(e) => {
++                if let Ok(response) = serde_json::from_value(json!({ "permissions": {} })) {
++                    let _ = thread
++                        .submit(Op::RequestPermissionsResponse {
++                            id: e.call_id,
++                            response,
++                        })
++                        .await;
++                }
++            }
+             EventMsg::TurnComplete(_) => {
+                 if !emitted_final_answer
+                     && let Some(message) = fallback_message.take().filter(|t| !t.is_empty())

@@ -1,0 +1,191 @@
+From 908289c543a1ae800498f5dc43f6e185ed0acddd Mon Sep 17 00:00:00 2001
+From: agentos-lab <lab@local>
+Date: Thu, 15 Oct 2026 01:48:51 -0700
+Subject: [PATCH 9/9] session-turn: read stdin non-blocking (agentOS parks
+ blocking reads for 10 s); CODEX_WASI_TIMING events
+
+---
+ codex-rs/exec/Cargo.toml               |  1 +
+ codex-rs/exec/src/session_turn_wasi.rs | 98 +++++++++++++++++++++++---
+ 2 files changed, 89 insertions(+), 10 deletions(-)
+
+diff --git a/codex-rs/exec/Cargo.toml b/codex-rs/exec/Cargo.toml
+index 37de872609..a5f5803151 100644
+--- a/codex-rs/exec/Cargo.toml
++++ b/codex-rs/exec/Cargo.toml
+@@ -73,6 +73,7 @@ codex-core-api = { workspace = true }
+ codex-exec-server = { workspace = true }
+ codex-history = { workspace = true }
+ codex-protocol = { workspace = true }
++libc = { workspace = true }
+ codex-utils-absolute-path = { workspace = true }
+ serde_json = { workspace = true }
+ tokio = { workspace = true, features = ["rt", "macros", "io-util", "io-std", "sync", "time"] }
+diff --git a/codex-rs/exec/src/session_turn_wasi.rs b/codex-rs/exec/src/session_turn_wasi.rs
+index 017ad14e5d..2b953b8479 100644
+--- a/codex-rs/exec/src/session_turn_wasi.rs
++++ b/codex-rs/exec/src/session_turn_wasi.rs
+@@ -100,22 +100,87 @@ pub(crate) fn resolve_self_exe() -> std::path::PathBuf {
+     std::path::PathBuf::from("/opt/agentos/bin").join(name)
+ }
+ 
++static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
++
++/// CODEX_WASI_TIMING=1: emit `{"type":"timing","phase":..,"ms":..}` events with guest
++/// monotonic time (guest wall-clock log timestamps are frozen in the agentOS VM).
++fn timing(phase: &str) {
++    if std::env::var_os("CODEX_WASI_TIMING").is_some() {
++        let ms = T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
++        emit(json!({ "type": "timing", "phase": phase, "ms": ms }));
++    }
++}
++
+ fn emit(v: Value) {
+     let mut out = std::io::stdout();
+     let _ = writeln!(out, "{v}");
+     let _ = out.flush();
+ }
+ 
+-fn read_line() -> Option<String> {
+-    let mut s = String::new();
+-    match std::io::stdin().read_line(&mut s) {
+-        Ok(0) | Err(_) => None,
+-        Ok(_) => Some(s),
++/// Line reader over fd 0 that never parks in a blocking read.
++///
++/// agentOS 0.4.1 services a blocking guest `read(0)` by parking `__kernel_stdin_read` for
++/// a 10 s slice (`KERNEL_WAIT_SLICE_MS` in the WASM runner), and a host
++/// `vm.process.writeStdin()` does not wake the parked read: the data is only seen when
++/// the slice expires. Measured with build/codex-latest/stdin-probe: blocking reads return
++/// 10,011 ms after the write, O_NONBLOCK reads within ~5 ms. Every permission_response
++/// (apply_patch, exec approvals) therefore cost 10 s. Read non-blocking and poll instead;
++/// the tokio sleep also lets codex-core tasks run while we wait for the host.
++struct StdinLines {
++    buf: Vec<u8>,
++    eof: bool,
++}
++
++impl StdinLines {
++    fn new() -> Self {
++        // SAFETY: plain fcntl on fd 0.
++        unsafe {
++            let flags = libc::fcntl(0, libc::F_GETFL);
++            if flags >= 0 {
++                libc::fcntl(0, libc::F_SETFL, flags | libc::O_NONBLOCK);
++            }
++        }
++        StdinLines { buf: Vec::new(), eof: false }
++    }
++
++    async fn next_line(&mut self) -> Option<String> {
++        let mut idle = std::time::Duration::from_millis(2);
++        loop {
++            if let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {
++                let line: Vec<u8> = self.buf.drain(..=pos).collect();
++                return Some(String::from_utf8_lossy(&line).into_owned());
++            }
++            if self.eof {
++                if self.buf.is_empty() {
++                    return None;
++                }
++                let rest = std::mem::take(&mut self.buf);
++                return Some(String::from_utf8_lossy(&rest).into_owned());
++            }
++            let mut chunk = [0u8; 8192];
++            // SAFETY: reads into a local buffer of the given length.
++            let n = unsafe { libc::read(0, chunk.as_mut_ptr().cast(), chunk.len()) };
++            if n > 0 {
++                self.buf.extend_from_slice(&chunk[..n as usize]);
++                idle = std::time::Duration::from_millis(2);
++            } else if n == 0 {
++                self.eof = true;
++            } else {
++                match std::io::Error::last_os_error().kind() {
++                    std::io::ErrorKind::WouldBlock => {
++                        tokio::time::sleep(idle).await;
++                        idle = (idle * 2).min(std::time::Duration::from_millis(25));
++                    }
++                    std::io::ErrorKind::Interrupted => {}
++                    _ => self.eof = true,
++                }
++            }
++        }
+     }
+ }
+ 
+-fn read_decision() -> ReviewDecision {
+-    let resp = read_line().unwrap_or_default();
++async fn read_decision(stdin: &mut StdinLines) -> ReviewDecision {
++    let resp = stdin.next_line().await.unwrap_or_default();
+     let resp: Value = serde_json::from_str(resp.trim()).unwrap_or_else(|_| json!({}));
+     match resp["decision"].as_str() {
+         Some("allow") | Some("approve") | Some("allow_always") => ReviewDecision::Approved,
+@@ -148,7 +213,8 @@ pub fn run() -> anyhow::Result<()> {
+ }
+ 
+ async fn session_turn() -> anyhow::Result<()> {
+-    let start_raw = read_line().context("no start message on stdin")?;
++    let mut stdin = StdinLines::new();
++    let start_raw = stdin.next_line().await.context("no start message on stdin")?;
+     let start: Value = serde_json::from_str(start_raw.trim()).context("bad start json")?;
+     let model = start["model"].as_str().unwrap_or("gpt-5").to_string();
+     let reasoning_effort = start["reasoning_effort"]
+@@ -298,6 +364,13 @@ async fn session_turn() -> anyhow::Result<()> {
+     let mut fallback_message: Option<String> = None;
+     loop {
+         let event = thread.next_event().await.context("next_event")?;
++        if std::env::var_os("CODEX_WASI_TIMING").is_some() {
++            let name = serde_json::to_value(&event.msg)
++                .ok()
++                .and_then(|v| v.get("type").and_then(|t| t.as_str().map(str::to_owned)))
++                .unwrap_or_default();
++            timing(&format!("event:{name}"));
++        }
+         match event.msg {
+             EventMsg::ItemStarted(e) => {
+                 if let TurnItem::AgentMessage(item) = e.item {
+@@ -393,7 +466,7 @@ async fn session_turn() -> anyhow::Result<()> {
+                     "title": "Shell",
+                     "command": e.command.join(" "),
+                 }));
+-                let decision = read_decision();
++                let decision = read_decision(&mut stdin).await;
+                 let _ = thread
+                     .submit(Op::ExecApproval {
+                         id: approval_id,
+@@ -403,6 +476,7 @@ async fn session_turn() -> anyhow::Result<()> {
+                     .await;
+             }
+             EventMsg::ApplyPatchApprovalRequest(e) => {
++                timing("patch_approval_request");
+                 emit(json!({
+                     "type": "permission_request",
+                     "tool_call_id": e.call_id,
+@@ -410,15 +484,18 @@ async fn session_turn() -> anyhow::Result<()> {
+                     "title": "Apply patch",
+                     "locations": e.changes.keys().map(|path| json!({ "path": path })).collect::<Vec<_>>(),
+                 }));
+-                let decision = read_decision();
++                let decision = read_decision(&mut stdin).await;
++                timing("patch_decision_read");
+                 let _ = thread
+                     .submit(Op::PatchApproval {
+                         id: e.call_id,
+                         decision,
+                     })
+                     .await;
++                timing("patch_approval_submitted");
+             }
+             EventMsg::PatchApplyBegin(e) => {
++                timing("patch_apply_begin");
+                 emit(json!({
+                     "type": "tool_call_update",
+                     "tool_call_id": e.call_id,
+@@ -429,6 +506,7 @@ async fn session_turn() -> anyhow::Result<()> {
+                 }));
+             }
+             EventMsg::PatchApplyEnd(e) => {
++                timing("patch_apply_end");
+                 emit(json!({
+                     "type": "tool_call_update",
+                     "tool_call_id": e.call_id,

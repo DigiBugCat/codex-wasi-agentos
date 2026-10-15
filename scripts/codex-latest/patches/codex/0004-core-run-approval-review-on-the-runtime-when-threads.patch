@@ -1,0 +1,46 @@
+From 8e5328229d8a0942c65909ecbbc684aea77c71df Mon Sep 17 00:00:00 2001
+From: agentos-lab <lab@local>
+Date: Thu, 15 Oct 2026 00:49:17 -0700
+Subject: [PATCH 4/9] core: run approval review on the runtime when threads are
+ unavailable (wasip1)
+
+---
+ codex-rs/core/src/guardian/decision.rs | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/codex-rs/core/src/guardian/decision.rs b/codex-rs/core/src/guardian/decision.rs
+index 2f7dc7c7b0..757ff71f00 100644
+--- a/codex-rs/core/src/guardian/decision.rs
++++ b/codex-rs/core/src/guardian/decision.rs
+@@ -25,7 +25,19 @@ pub(crate) fn spawn_approval_decision(
+     let context: GuardianReviewContext = context.into();
+     let request: ReviewAction = request.into();
+     let (tx, rx) = oneshot::channel();
++    // wasm32-wasip1 (agentOS) has no threads: run the review on the current runtime.
++    #[cfg(target_os = "wasi")]
++    {
++        tokio::spawn(async move {
++            let decision =
++                decide_approval(session, context, review_id, request, reasons, options).await;
++            let _ = tx.send(decision);
++        });
++        return rx;
++    }
++    #[cfg(not(target_os = "wasi"))]
+     let runtime = session.services.runtime_handle.clone();
++    #[cfg(not(target_os = "wasi"))]
+     let spawn_result = std::thread::Builder::new()
+         .name("codex-approval-review".to_string())
+         .stack_size(THREAD_STACK_SIZE_BYTES)
+@@ -35,9 +47,11 @@ pub(crate) fn spawn_approval_decision(
+             ));
+             let _ = tx.send(decision);
+         });
++    #[cfg(not(target_os = "wasi"))]
+     if let Err(err) = spawn_result {
+         tracing::error!(%err, "failed to spawn automatic approval review worker");
+     }
++    #[cfg(not(target_os = "wasi"))]
+     rx
+ }
+ 

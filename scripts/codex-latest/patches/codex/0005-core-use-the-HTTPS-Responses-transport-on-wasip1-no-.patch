@@ -1,0 +1,26 @@
+From 024352077164b510412a409c9636f459afab4613 Mon Sep 17 00:00:00 2001
+From: agentos-lab <lab@local>
+Date: Thu, 15 Oct 2026 00:49:17 -0700
+Subject: [PATCH 5/9] core: use the HTTPS Responses transport on wasip1 (no
+ tokio::net connect)
+
+---
+ codex-rs/core/src/client.rs | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+index 0bab5f257a..f1d77fd3f1 100644
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -1110,6 +1110,11 @@ impl ModelClient {
+     ///
+     /// WebSocket use is controlled by provider capability and session-scoped fallback state.
+     pub fn responses_websocket_enabled(&self) -> bool {
++        // wasm32-wasip1 (agentOS): no outbound sockets from tokio::net; always use the
++        // host-brokered HTTPS Responses transport.
++        if cfg!(target_os = "wasi") {
++            return false;
++        }
+         if !self.state.provider.info().supports_websockets
+             || self.state.disable_websockets.load(Ordering::Relaxed)
+         {

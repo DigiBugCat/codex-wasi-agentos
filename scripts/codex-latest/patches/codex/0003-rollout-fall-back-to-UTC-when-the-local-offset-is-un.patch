@@ -1,0 +1,26 @@
+From 92a7d16ae4c856b748691f4c7058caed7c56b944 Mon Sep 17 00:00:00 2001
+From: agentos-lab <lab@local>
+Date: Thu, 15 Oct 2026 00:49:17 -0700
+Subject: [PATCH 3/9] rollout: fall back to UTC when the local offset is
+ unknown (wasip1)
+
+---
+ codex-rs/rollout/src/recorder.rs | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/codex-rs/rollout/src/recorder.rs b/codex-rs/rollout/src/recorder.rs
+index 765d83ccc7..9837f3f571 100644
+--- a/codex-rs/rollout/src/recorder.rs
++++ b/codex-rs/rollout/src/recorder.rs
+@@ -1742,8 +1742,9 @@ fn precompute_new_rollout_path(
+     rollout_id_override: Option<RolloutId>,
+ ) -> std::io::Result<(PathBuf, OffsetDateTime)> {
+     // Resolve ~/.codex/sessions/YYYY/MM/DD path.
+-    let timestamp = OffsetDateTime::now_local()
+-        .map_err(|e| IoError::other(format!("failed to get local time: {e}")))?;
++    // wasm32-wasip1 (agentOS) has no local timezone database, so now_local() cannot
++    // determine the UTC offset; fall back to UTC for the session-path timestamp.
++    let timestamp = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+     let mut dir = config.codex_home().to_path_buf();
+     dir.push(SESSIONS_SUBDIR);
+     dir.push(timestamp.year().to_string());

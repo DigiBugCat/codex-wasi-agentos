@@ -1,0 +1,727 @@
+From 8186c39e31310abaa9917b75e0cc9c034c13a5c6 Mon Sep 17 00:00:00 2001
+From: agentos-lab <lab@local>
+Date: Thu, 15 Oct 2026 00:49:17 -0700
+Subject: [PATCH 1/9] wasi: wasm32-wasip1 build plumbing (WASI crate patches,
+ zip features, native-only deps)
+
+---
+ codex-rs/Cargo.lock                           | 281 ++----------------
+ codex-rs/Cargo.toml                           |  20 +-
+ codex-rs/http-client/Cargo.toml               |   5 +-
+ .../src/route_aware_client_pool.rs            |   8 +-
+ codex-rs/mxc-sandbox/Cargo.toml               |   3 +-
+ 5 files changed, 61 insertions(+), 256 deletions(-)
+
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index 094cd52d20..8b6ea70266 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -113,6 +113,13 @@ dependencies = [
+  "sha2 0.10.9",
+ ]
+ 
++[[package]]
++name = "agentos-wasi-http"
++version = "0.0.0"
++dependencies = [
++ "wasi-ext",
++]
++
+ [[package]]
+ name = "ahash"
+ version = "0.8.12"
+@@ -1533,25 +1540,6 @@ dependencies = [
+  "either",
+ ]
+ 
+-[[package]]
+-name = "bzip2"
+-version = "0.5.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "49ecfb22d906f800d4fe833b6282cf4dc1c298f5057ca0b5445e5c209735ca47"
+-dependencies = [
+- "bzip2-sys",
+-]
+-
+-[[package]]
+-name = "bzip2-sys"
+-version = "0.1.13+1.0.8"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "225bff33b2141874fe80d71e07d6eec4f85c5c216453dd96388240f96e1acc14"
+-dependencies = [
+- "cc",
+- "pkg-config",
+-]
+-
+ [[package]]
+ name = "cached"
+ version = "0.56.0"
+@@ -3181,6 +3169,8 @@ dependencies = [
+  "codex-cloud-config",
+  "codex-config",
+  "codex-core",
++ "codex-core-api",
++ "codex-exec-server",
+  "codex-features",
+  "codex-feedback",
+  "codex-git-utils",
+@@ -3210,6 +3200,7 @@ dependencies = [
+  "supports-color 3.0.2",
+  "tempfile",
+  "tokio",
++ "toml 0.9.11+spec-1.1.0",
+  "tracing",
+  "tracing-opentelemetry",
+  "tracing-subscriber",
+@@ -5556,17 +5547,6 @@ dependencies = [
+  "unicode-segmentation",
+ ]
+ 
+-[[package]]
+-name = "cookie"
+-version = "0.18.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "4ddef33a339a91ea89fb53151bd0a4689cfce27055c291dfa69945475d22c747"
+-dependencies = [
+- "percent-encoding",
+- "time",
+- "version_check",
+-]
+-
+ [[package]]
+ name = "cookie-factory"
+ version = "0.3.3"
+@@ -5576,24 +5556,6 @@ dependencies = [
+  "futures",
+ ]
+ 
+-[[package]]
+-name = "cookie_store"
+-version = "0.22.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "15b2c103cf610ec6cae3da84a766285b42fd16aad564758459e6ecf128c75206"
+-dependencies = [
+- "cookie",
+- "document-features",
+- "idna",
+- "log",
+- "publicsuffix",
+- "serde",
+- "serde_derive",
+- "serde_json",
+- "time",
+- "url",
+-]
+-
+ [[package]]
+ name = "core-foundation"
+ version = "0.9.4"
+@@ -6248,12 +6210,6 @@ dependencies = [
+  "serde_json",
+ ]
+ 
+-[[package]]
+-name = "deflate64"
+-version = "0.1.10"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "26bf8fc351c5ed29b5c2f0cbbac1b209b74f60ecd62e675a998df72c49af5204"
+-
+ [[package]]
+ name = "defmt"
+ version = "0.3.100"
+@@ -6610,19 +6566,10 @@ checksum = "6e39034cee21a2f5bbb66ba0e3689819c4bb5d00382a282006e802a7ffa6c41d"
+ dependencies = [
+  "cfg-if",
+  "libc",
+- "socket2 0.6.3",
++ "socket2 0.6.5",
+  "windows-sys 0.60.2",
+ ]
+ 
+-[[package]]
+-name = "document-features"
+-version = "0.2.12"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
+-dependencies = [
+- "litrs",
+-]
+-
+ [[package]]
+ name = "dotenvy"
+ version = "0.15.7"
+@@ -7457,8 +7404,6 @@ dependencies = [
+ [[package]]
+ name = "gethostname"
+ version = "1.1.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "1bd49230192a3797a9a4d6abe9b3eed6f7fa4c8a8a4947977c6f80025f92cbd8"
+ dependencies = [
+  "rustix 1.1.4",
+  "windows-link",
+@@ -7484,11 +7429,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
+ dependencies = [
+  "cfg-if",
+- "js-sys",
+  "libc",
+  "r-efi 5.3.0",
+  "wasip2",
+- "wasm-bindgen",
+ ]
+ 
+ [[package]]
+@@ -8832,7 +8775,6 @@ dependencies = [
+  "tokio",
+  "tokio-rustls",
+  "tower-service",
+- "webpki-roots",
+ ]
+ 
+ [[package]]
+@@ -8848,27 +8790,9 @@ dependencies = [
+  "tower-service",
+ ]
+ 
+-[[package]]
+-name = "hyper-tls"
+-version = "0.6.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "70206fc6890eaca9fde8a0bf71caa2ddfc9fe045ac9e5c70df101a7dbde866e0"
+-dependencies = [
+- "bytes",
+- "http-body-util",
+- "hyper",
+- "hyper-util",
+- "native-tls",
+- "tokio",
+- "tokio-native-tls",
+- "tower-service",
+-]
+-
+ [[package]]
+ name = "hyper-util"
+ version = "0.1.20"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
+ dependencies = [
+  "base64 0.22.1",
+  "bytes",
+@@ -8881,12 +8805,10 @@ dependencies = [
+  "libc",
+  "percent-encoding",
+  "pin-project-lite",
+- "socket2 0.6.3",
+- "system-configuration",
++ "socket2 0.5.10",
+  "tokio",
+  "tower-service",
+  "tracing",
+- "windows-registry",
+ ]
+ 
+ [[package]]
+@@ -9751,8 +9673,6 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
+ [[package]]
+ name = "libc"
+ version = "0.2.186"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+ 
+ [[package]]
+ name = "libdbus-sys"
+@@ -9859,12 +9779,6 @@ version = "0.8.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
+ 
+-[[package]]
+-name = "litrs"
+-version = "1.0.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
+-
+ [[package]]
+ name = "lock_api"
+ version = "0.4.14"
+@@ -9968,27 +9882,6 @@ dependencies = [
+  "serde_repr",
+ ]
+ 
+-[[package]]
+-name = "lzma-rs"
+-version = "0.3.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "297e814c836ae64db86b36cf2a557ba54368d03f6afcd7d947c266692f71115e"
+-dependencies = [
+- "byteorder",
+- "crc",
+-]
+-
+-[[package]]
+-name = "lzma-sys"
+-version = "0.1.20"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "5fda04ab3764e6cde78b9974eec4f779acaba7c4e84b36eca3cf77c581b85d27"
+-dependencies = [
+- "cc",
+- "libc",
+- "pkg-config",
+-]
+-
+ [[package]]
+ name = "mac_address"
+ version = "1.1.8"
+@@ -10980,8 +10873,6 @@ dependencies = [
+ [[package]]
+ name = "opentelemetry-http"
+ version = "0.31.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d7a6d09a73194e6b66df7c8f1b680f156d916a1a942abf2de06823dd02b7855d"
+ dependencies = [
+  "async-trait",
+  "bytes",
+@@ -11566,8 +11457,6 @@ dependencies = [
+ [[package]]
+ name = "portable-pty"
+ version = "0.9.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "b4a596a2b3d2752d94f51fac2d4a96737b8705dddd311a32b9af47211f08671e"
+ dependencies = [
+  "anyhow",
+  "bitflags 1.3.2",
+@@ -11919,16 +11808,6 @@ dependencies = [
+  "syn 3.0.3",
+ ]
+ 
+-[[package]]
+-name = "publicsuffix"
+-version = "2.3.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "6f42ea446cab60335f76979ec15e12619a2165b5ae2c12166bef27d283a9fadf"
+-dependencies = [
+- "idna",
+- "psl-types",
+-]
+-
+ [[package]]
+ name = "pulldown-cmark"
+ version = "0.10.3"
+@@ -12006,7 +11885,7 @@ dependencies = [
+  "quinn-udp 0.5.14",
+  "rustc-hash",
+  "rustls",
+- "socket2 0.6.3",
++ "socket2 0.5.10",
+  "thiserror 2.0.18",
+  "tokio",
+  "tracing",
+@@ -12044,7 +11923,7 @@ dependencies = [
+  "cfg_aliases 0.2.1",
+  "libc",
+  "once_cell",
+- "socket2 0.6.3",
++ "socket2 0.5.10",
+  "tracing",
+  "windows-sys 0.60.2",
+ ]
+@@ -12058,7 +11937,7 @@ dependencies = [
+  "cfg_aliases 0.2.1",
+  "libc",
+  "log",
+- "socket2 0.6.3",
++ "socket2 0.5.10",
+  "windows-sys 0.61.2",
+ ]
+ 
+@@ -12294,8 +12173,6 @@ dependencies = [
+ [[package]]
+ name = "rama-net"
+ version = "0.3.0-alpha.4"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "b28ee9e1e5d39264414b71f5c33e7fbb66b382c3fac456fe0daad39cf5509933"
+ dependencies = [
+  "ahash",
+  "const_format",
+@@ -12315,7 +12192,7 @@ dependencies = [
+  "rama-utils",
+  "serde",
+  "sha2 0.10.9",
+- "socket2 0.6.3",
++ "socket2 0.6.5",
+  "tokio",
+ ]
+ 
+@@ -12337,8 +12214,6 @@ dependencies = [
+ [[package]]
+ name = "rama-tcp"
+ version = "0.3.0-alpha.4"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "fe60cd604f91196b3659a1b28945add2e8b10bd0b4e6373c93d024fb3197704b"
+ dependencies = [
+  "pin-project-lite",
+  "rama-core",
+@@ -12374,8 +12249,6 @@ dependencies = [
+ [[package]]
+ name = "rama-udp"
+ version = "0.3.0-alpha.4"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "36ed05e0ecac73e084e92a3a8b1fbf16fdae8958c506f0f0eada180a2d99eef4"
+ dependencies = [
+  "rama-core",
+  "rama-net",
+@@ -12780,52 +12653,17 @@ dependencies = [
+ [[package]]
+ name = "reqwest"
+ version = "0.12.28"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
+ dependencies = [
++ "agentos-wasi-http",
+  "base64 0.22.1",
+  "bytes",
+- "cookie",
+- "cookie_store",
+- "encoding_rs",
+- "futures-channel",
+  "futures-core",
+- "futures-util",
+- "h2",
+  "http 1.4.0",
+  "http-body 1.0.1",
+- "http-body-util",
+- "hyper",
+- "hyper-rustls",
+- "hyper-tls",
+- "hyper-util",
+- "js-sys",
+- "log",
+- "mime",
+- "native-tls",
+- "percent-encoding",
+- "pin-project-lite",
+- "quinn",
+- "rustls",
+- "rustls-native-certs",
+- "rustls-pki-types",
+  "serde",
+  "serde_json",
+  "serde_urlencoded",
+- "sync_wrapper",
+- "tokio",
+- "tokio-native-tls",
+- "tokio-rustls",
+- "tokio-util",
+- "tower",
+- "tower-http",
+- "tower-service",
+  "url",
+- "wasm-bindgen",
+- "wasm-bindgen-futures",
+- "wasm-streams 0.4.2",
+- "web-sys",
+- "webpki-roots",
+ ]
+ 
+ [[package]]
+@@ -12858,7 +12696,7 @@ dependencies = [
+  "url",
+  "wasm-bindgen",
+  "wasm-bindgen-futures",
+- "wasm-streams 0.5.0",
++ "wasm-streams",
+  "web-sys",
+ ]
+ 
+@@ -13115,7 +12953,7 @@ dependencies = [
+  "log",
+  "rtc-shared",
+  "sansio",
+- "socket2 0.6.3",
++ "socket2 0.6.5",
+ ]
+ 
+ [[package]]
+@@ -13393,8 +13231,6 @@ dependencies = [
+ [[package]]
+ name = "rustls-native-certs"
+ version = "0.8.3"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "612460d5f7bea540c490b2b6395d8e34a953e52b491accd6c86c8164c5932a63"
+ dependencies = [
+  "openssl-probe 0.2.1",
+  "rustls-pki-types",
+@@ -14245,12 +14081,10 @@ dependencies = [
+ 
+ [[package]]
+ name = "socket2"
+-version = "0.6.3"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
++version = "0.6.5"
+ dependencies = [
+  "libc",
+- "windows-sys 0.61.2",
++ "windows-sys 0.60.2",
+ ]
+ 
+ [[package]]
+@@ -15492,8 +15326,6 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
+ [[package]]
+ name = "tokio"
+ version = "1.52.3"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
+ dependencies = [
+  "bytes",
+  "libc",
+@@ -15501,7 +15333,7 @@ dependencies = [
+  "parking_lot",
+  "pin-project-lite",
+  "signal-hook-registry",
+- "socket2 0.6.3",
++ "socket2 0.6.5",
+  "tokio-macros",
+  "windows-sys 0.61.2",
+ ]
+@@ -15509,8 +15341,6 @@ dependencies = [
+ [[package]]
+ name = "tokio-graceful"
+ version = "0.2.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "45740b38b48641855471cd402922e89156bdfbd97b69b45eeff170369cc18c7d"
+ dependencies = [
+  "loom",
+  "pin-project-lite",
+@@ -15530,16 +15360,6 @@ dependencies = [
+  "syn 2.0.117",
+ ]
+ 
+-[[package]]
+-name = "tokio-native-tls"
+-version = "0.3.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "bbae76ab933c85776efabc971569dd6119c580d8f5d448769dec1764bf796ef2"
+-dependencies = [
+- "native-tls",
+- "tokio",
+-]
+-
+ [[package]]
+ name = "tokio-rustls"
+ version = "0.26.4"
+@@ -15704,8 +15524,6 @@ checksum = "ab16f14aed21ee8bfd8ec22513f7287cd4a91aa92e44edfe2c17ddd004e92607"
+ [[package]]
+ name = "tonic"
+ version = "0.14.3"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "a286e33f82f8a1ee2df63f4fa35c0becf4a85a0cb03091a15fd7bf0b402dc94a"
+ dependencies = [
+  "async-trait",
+  "axum",
+@@ -15721,7 +15539,7 @@ dependencies = [
+  "percent-encoding",
+  "pin-project",
+  "rustls-native-certs",
+- "socket2 0.6.3",
++ "socket2 0.6.5",
+  "sync_wrapper",
+  "tokio",
+  "tokio-rustls",
+@@ -16441,6 +16259,10 @@ version = "0.11.1+wasi-snapshot-preview1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
+ 
++[[package]]
++name = "wasi-ext"
++version = "0.0.0"
++
+ [[package]]
+ name = "wasip2"
+ version = "1.0.2+wasi-0.2.9"
+@@ -16546,19 +16368,6 @@ dependencies = [
+  "wasmparser",
+ ]
+ 
+-[[package]]
+-name = "wasm-streams"
+-version = "0.4.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+-dependencies = [
+- "futures-util",
+- "js-sys",
+- "wasm-bindgen",
+- "wasm-bindgen-futures",
+- "web-sys",
+-]
+-
+ [[package]]
+ name = "wasm-streams"
+ version = "0.5.0"
+@@ -17033,17 +16842,6 @@ dependencies = [
+  "windows-link",
+ ]
+ 
+-[[package]]
+-name = "windows-registry"
+-version = "0.6.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "02752bf7fbdcce7f2a27a742f798510f3e5ad88dbe84871e5168e2120c3d5720"
+-dependencies = [
+- "windows-link",
+- "windows-result 0.4.1",
+- "windows-strings 0.5.1",
+-]
+-
+ [[package]]
+ name = "windows-result"
+ version = "0.2.0"
+@@ -17617,15 +17415,6 @@ version = "0.13.6"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
+ 
+-[[package]]
+-name = "xz2"
+-version = "0.1.7"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "388c44dc09d76f1536602ead6d325eb532f5c122f17782bd57fb47baeeb767e2"
+-dependencies = [
+- "lzma-sys",
+-]
+-
+ [[package]]
+ name = "yansi"
+ version = "1.0.1"
+@@ -17829,28 +17618,16 @@ version = "2.4.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "fabe6324e908f85a1c52063ce7aa26b68dcb7eb6dbc83a2d148403c9bc3eba50"
+ dependencies = [
+- "aes",
+  "arbitrary",
+- "bzip2",
+- "constant_time_eq",
+  "crc32fast",
+  "crossbeam-utils",
+- "deflate64",
+  "displaydoc",
+  "flate2",
+- "getrandom 0.3.4",
+- "hmac 0.12.1",
+  "indexmap 2.14.0",
+- "lzma-rs",
+  "memchr",
+- "pbkdf2",
+- "sha1 0.10.6",
+  "thiserror 2.0.18",
+  "time",
+- "xz2",
+- "zeroize",
+  "zopfli",
+- "zstd",
+ ]
+ 
+ [[package]]
+@@ -17990,3 +17767,7 @@ dependencies = [
+  "quote",
+  "syn 2.0.117",
+ ]
++
++[[patch.unused]]
++name = "ctrlc"
++version = "3.5.2"
+diff --git a/codex-rs/Cargo.toml b/codex-rs/Cargo.toml
+index 48d05279d0..a9179ef0b4 100644
+--- a/codex-rs/Cargo.toml
++++ b/codex-rs/Cargo.toml
+@@ -549,7 +549,7 @@ whoami = "1.6.1"
+ wildmatch = "2.6.1"
+ winapi-util = "0.1.11"
+ windows-sys = "0.61.2"
+-zip = "2.4.2"
++zip = { version = "2.4.2", default-features = false, features = ["deflate", "time"] }  # wasi: no bzip2/lzma/zstd C deps
+ zstd = "0.13"
+ 
+ wiremock = "0.6"
+@@ -639,6 +639,24 @@ inherits = "test"
+ opt-level = 0
+ 
+ [patch.crates-io]
++# wasm32-wasip1 (agentOS): WASI replacements, staged into wasi-deps/ by scripts/codex-latest/build.sh
++tokio = { path = "wasi-deps/tokio" }
++reqwest = { path = "wasi-deps/stubs/reqwest-shim" }
++portable-pty = { path = "wasi-deps/stubs/portable-pty-wasi" }
++ctrlc = { path = "wasi-deps/stubs/ctrlc" }
++rustls-native-certs = { path = "wasi-deps/patched/rustls-native-certs-0.8.3" }
++tokio-graceful = { path = "wasi-deps/patched/tokio-graceful-0.2.2" }
++gethostname = { path = "wasi-deps/patched/gethostname-1.1.0" }
++hyper-util = { path = "wasi-deps/patched/hyper-util-0.1.20" }
++libc = { path = "wasi-deps/patched/libc-0.2.186" }
++# gix-fs 0.19 (rust-v0.162.x) has no wasi arm; main uses gix-fs 0.24 and ignores this entry.
++gix-fs = { path = "wasi-deps/patched/gix-fs-0.19.2" }
++socket2 = { path = "wasi-deps/patched/socket2-0.6.5" }
++tonic = { path = "wasi-deps/patched/tonic-0.14.3" }
++opentelemetry-http = { path = "wasi-deps/patched/opentelemetry-http-0.31.0" }
++rama-net = { path = "wasi-deps/patched/rama-net-0.3.0-alpha.4" }
++rama-tcp = { path = "wasi-deps/patched/rama-tcp-0.3.0-alpha.4" }
++rama-udp = { path = "wasi-deps/patched/rama-udp-0.3.0-alpha.4" }
+ # Uncomment to debug local changes.
+ # ratatui = { path = "../../ratatui" }
+ crossterm = { git = "https://github.com/openai-oss-forks/crossterm", rev = "ed1cdab335221515706178d68495bba2aed1924f" }
+diff --git a/codex-rs/http-client/Cargo.toml b/codex-rs/http-client/Cargo.toml
+index 8583220338..f3c7f39412 100644
+--- a/codex-rs/http-client/Cargo.toml
++++ b/codex-rs/http-client/Cargo.toml
+@@ -11,7 +11,6 @@ futures = { workspace = true }
+ http = { workspace = true }
+ http-body = "1.0.1"
+ httpdate = { workspace = true }
+-native-tls = "0.2"
+ opentelemetry = { workspace = true }
+ reqwest = { workspace = true, features = ["json", "rustls-tls", "rustls-tls-native-roots", "stream"] }
+ rustls = { workspace = true }
+@@ -27,6 +26,10 @@ tracing = { workspace = true }
+ tracing-opentelemetry = { workspace = true }
+ zstd = { workspace = true }
+ 
++# wasm32-wasip1 (agentOS): no OpenSSL; TLS is host-brokered.
++[target.'cfg(not(target_os = "wasi"))'.dependencies]
++native-tls = "0.2"
++
+ [target.'cfg(target_os = "macos")'.dependencies]
+ system-configuration = { workspace = true }
+ 
+diff --git a/codex-rs/http-client/src/route_aware_client_pool.rs b/codex-rs/http-client/src/route_aware_client_pool.rs
+index 905aaf8f0d..9a27c8f284 100644
+--- a/codex-rs/http-client/src/route_aware_client_pool.rs
++++ b/codex-rs/http-client/src/route_aware_client_pool.rs
+@@ -119,9 +119,11 @@ impl RouteAwareRequestError {
+ 
+         let mut source: Option<&(dyn std::error::Error + 'static)> = Some(self);
+         while let Some(error) = source {
+-            if error.downcast_ref::<rustls::Error>().is_some()
+-                || error.downcast_ref::<native_tls::Error>().is_some()
+-            {
++            #[cfg(not(target_os = "wasi"))]
++            let is_native_tls = error.downcast_ref::<native_tls::Error>().is_some();
++            #[cfg(target_os = "wasi")]
++            let is_native_tls = false;
++            if error.downcast_ref::<rustls::Error>().is_some() || is_native_tls {
+                 return Some(RouteFailureClass::TlsError);
+             }
+             if error.to_string() == "tunnel error: proxy authorization required" {
+diff --git a/codex-rs/mxc-sandbox/Cargo.toml b/codex-rs/mxc-sandbox/Cargo.toml
+index 49b5c16e66..500f09394e 100644
+--- a/codex-rs/mxc-sandbox/Cargo.toml
++++ b/codex-rs/mxc-sandbox/Cargo.toml
+@@ -24,9 +24,10 @@ codex-windows-sandbox = { workspace = true }
+ serde = { workspace = true, features = ["derive"] }
+ serde_json = { workspace = true }
+ thiserror = { workspace = true }
+-wxc_common = { workspace = true }
+ 
+ [target.'cfg(windows)'.dependencies]
++# Only native.rs (cfg(windows)) uses wxc_common; it does not build for wasm32-wasip1.
++wxc_common = { workspace = true }
+ appcontainer_common = { workspace = true }
+ learning_mode_windows = { workspace = true }
+ # 1.2.4 imports OneCore_apiset, which the GNU Windows toolchain does not ship.

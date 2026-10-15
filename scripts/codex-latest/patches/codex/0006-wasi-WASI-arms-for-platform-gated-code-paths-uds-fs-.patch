@@ -1,0 +1,568 @@
+From 5ecc08e375febaf0e4f1ba74033666a9baa51b17 Mon Sep 17 00:00:00 2001
+From: agentos-lab <lab@local>
+Date: Thu, 15 Oct 2026 00:49:17 -0700
+Subject: [PATCH 6/9] wasi: WASI arms for platform-gated code (paths, uds, fs,
+ exec, git, config)
+
+---
+ codex-rs/arg0/src/lib.rs                      |   2 +-
+ codex-rs/config/src/loader/mod.rs             |   6 +-
+ codex-rs/core/src/exec.rs                     |  25 ++++-
+ codex-rs/core/src/lib.rs                      |   1 +
+ codex-rs/exec-server/src/file_handle.rs       |  11 ++
+ codex-rs/exec-server/src/lib.rs               |   1 +
+ codex-rs/exec-server/src/no_follow/mod.rs     |   6 +-
+ codex-rs/exec-server/src/no_follow/wasi.rs    | 104 ++++++++++++++++++
+ .../exec-server/src/sandboxed_file_open.rs    |  12 ++
+ codex-rs/git-utils/src/lib.rs                 |   1 +
+ codex-rs/git-utils/src/platform.rs            |  13 ++-
+ codex-rs/rmcp-client/src/program_resolver.rs  |   2 +-
+ codex-rs/rmcp-client/src/utils.rs             |   2 +-
+ codex-rs/state/src/lib.rs                     |   1 +
+ codex-rs/state/src/sqlite/validation.rs       |   8 ++
+ codex-rs/uds/src/lib.rs                       |  63 +++++++++++
+ codex-rs/utils/path-uri/src/lib.rs            |  12 +-
+ codex-rs/utils/path-uri/src/platform.rs       |   3 +-
+ .../utils/path-utils/src/system_commands.rs   |   4 +-
+ 19 files changed, 262 insertions(+), 15 deletions(-)
+ create mode 100644 codex-rs/exec-server/src/no_follow/wasi.rs
+
+diff --git a/codex-rs/arg0/src/lib.rs b/codex-rs/arg0/src/lib.rs
+index 31ed3723c2..5a9d63a8f2 100644
+--- a/codex-rs/arg0/src/lib.rs
++++ b/codex-rs/arg0/src/lib.rs
+@@ -439,7 +439,7 @@ fn path_env_with_package_path_dir(
+ }
+ 
+ fn path_env_with_entry(path_entry: &Path, existing_path: Option<OsString>) -> OsString {
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     const PATH_SEPARATOR: &str = ":";
+ 
+     #[cfg(windows)]
+diff --git a/codex-rs/config/src/loader/mod.rs b/codex-rs/config/src/loader/mod.rs
+index 46dbb8b055..589b0f85d0 100644
+--- a/codex-rs/config/src/loader/mod.rs
++++ b/codex-rs/config/src/loader/mod.rs
+@@ -76,7 +76,7 @@ pub use windows::WindowsSystemConfigNamespaceProbe;
+ #[cfg(windows)]
+ pub use windows::probe_windows_system_config_namespace;
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ const SYSTEM_CONFIG_TOML_FILE_UNIX: &str = "/etc/codex/config.toml";
+ 
+ #[cfg(windows)]
+@@ -726,7 +726,7 @@ pub async fn load_requirements_toml(
+     }
+ }
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ fn system_requirements_toml_file() -> io::Result<AbsolutePathBuf> {
+     AbsolutePathBuf::from_absolute_path(Path::new("/etc/codex/requirements.toml"))
+ }
+@@ -781,7 +781,7 @@ fn has_local_managed_configuration_with_system_requirements_path(
+     Ok(false)
+ }
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ pub fn system_config_toml_file() -> io::Result<AbsolutePathBuf> {
+     AbsolutePathBuf::from_absolute_path(Path::new(SYSTEM_CONFIG_TOML_FILE_UNIX))
+ }
+diff --git a/codex-rs/core/src/exec.rs b/codex-rs/core/src/exec.rs
+index f72396e383..37cde47305 100644
+--- a/codex-rs/core/src/exec.rs
++++ b/codex-rs/core/src/exec.rs
+@@ -1075,7 +1075,7 @@ async fn consume_output(
+                 None => unreachable!("expiration wait only resolves while expiration is active"),
+             }
+         }
+-        _ = tokio::signal::ctrl_c() => {
++        _ = wait_ctrl_c() => {
+             kill_child_process_group(&mut child)?;
+             child.start_kill()?;
+             (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + SIGKILL_CODE), false)
+@@ -1259,6 +1259,29 @@ fn synthetic_exit_status_for_code(code: i32) -> ExitStatus {
+     std::process::ExitStatus::from_raw(code << 8)
+ }
+ 
++#[cfg(not(target_os = "wasi"))]
++async fn wait_ctrl_c() {
++    let _ = tokio::signal::ctrl_c().await;
++}
++
++/// agentOS wasm32-wasip1: no Ctrl-C/signals in the VM; never fires.
++#[cfg(target_os = "wasi")]
++async fn wait_ctrl_c() {
++    std::future::pending::<()>().await;
++}
++
++#[cfg(target_os = "wasi")]
++fn synthetic_exit_status(code: i32) -> ExitStatus {
++    use std::os::wasi::process::ExitStatusExt;
++    std::process::ExitStatus::from_raw(code)
++}
++
++#[cfg(target_os = "wasi")]
++fn synthetic_exit_status_for_code(code: i32) -> ExitStatus {
++    use std::os::wasi::process::ExitStatusExt;
++    std::process::ExitStatus::from_raw(code << 8)
++}
++
+ #[cfg(windows)]
+ fn synthetic_exit_status(code: i32) -> ExitStatus {
+     use std::os::windows::process::ExitStatusExt;
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+index e722464838..4ba99ac4a2 100644
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -3,6 +3,7 @@
+ // Prevent accidental direct writes to stdout/stderr in library code. All
+ // user-visible output must go through the appropriate abstraction (e.g.,
+ // the TUI or the tracing stack).
++#![cfg_attr(target_os = "wasi", feature(wasi_ext))]
+ #![deny(clippy::print_stdout, clippy::print_stderr)]
+ 
+ mod apply_patch;
+diff --git a/codex-rs/exec-server/src/file_handle.rs b/codex-rs/exec-server/src/file_handle.rs
+index a180b5696d..a2ac80d345 100644
+--- a/codex-rs/exec-server/src/file_handle.rs
++++ b/codex-rs/exec-server/src/file_handle.rs
+@@ -125,6 +125,12 @@ impl FileHandleManager {
+                     &bytes[written..],
+                     position,
+                 );
++                #[cfg(target_os = "wasi")]
++                let result = std::os::wasi::fs::FileExt::write_at(
++                    file.as_ref(),
++                    &bytes[written..],
++                    position,
++                );
+                 #[cfg(windows)]
+                 let result = std::os::windows::fs::FileExt::seek_write(
+                     file.as_ref(),
+@@ -205,6 +211,11 @@ fn read_file_at(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<usize>
+     std::os::unix::fs::FileExt::read_at(file, bytes, offset)
+ }
+ 
++#[cfg(target_os = "wasi")]
++fn read_file_at(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<usize> {
++    std::os::wasi::fs::FileExt::read_at(file, bytes, offset)
++}
++
+ #[cfg(windows)]
+ fn read_file_at(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<usize> {
+     std::os::windows::fs::FileExt::seek_read(file, bytes, offset)
+diff --git a/codex-rs/exec-server/src/lib.rs b/codex-rs/exec-server/src/lib.rs
+index cd928c0fed..3d657f4699 100644
+--- a/codex-rs/exec-server/src/lib.rs
++++ b/codex-rs/exec-server/src/lib.rs
+@@ -1,3 +1,4 @@
++#![cfg_attr(target_os = "wasi", feature(wasi_ext))]
+ mod arg0_exec_helper;
+ mod capability_discovery;
+ mod capability_discovery_cache;
+diff --git a/codex-rs/exec-server/src/no_follow/mod.rs b/codex-rs/exec-server/src/no_follow/mod.rs
+index d7abd7ff9c..3136a9111b 100644
+--- a/codex-rs/exec-server/src/no_follow/mod.rs
++++ b/codex-rs/exec-server/src/no_follow/mod.rs
+@@ -8,11 +8,15 @@ use std::time::UNIX_EPOCH;
+ 
+ #[cfg(unix)]
+ mod unix;
++#[cfg(target_os = "wasi")]
++mod wasi;
+ #[cfg(windows)]
+ mod windows;
+ 
+ #[cfg(unix)]
+ use unix as imp;
++#[cfg(target_os = "wasi")]
++use wasi as imp;
+ #[cfg(windows)]
+ use windows as imp;
+ 
+@@ -24,7 +28,7 @@ pub(crate) async fn write_file(path: &Path, contents: Vec<u8>) -> io::Result<()>
+     imp::write_file(path.to_path_buf(), contents).await
+ }
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ pub(crate) async fn metadata(path: &Path) -> io::Result<FileMetadata> {
+     imp::metadata(path.to_path_buf()).await
+ }
+diff --git a/codex-rs/exec-server/src/no_follow/wasi.rs b/codex-rs/exec-server/src/no_follow/wasi.rs
+new file mode 100644
+index 0000000000..22852a8a4a
+--- /dev/null
++++ b/codex-rs/exec-server/src/no_follow/wasi.rs
+@@ -0,0 +1,104 @@
++//! agentOS wasm32-wasip1: best-effort no-follow filesystem operations over std::fs.
++//! WASI preview 1 has no O_NOFOLLOW-by-fd walk from "/", and the agentOS VM is itself
++//! the sandbox, so this checks for symlinks with `symlink_metadata` instead.
++use crate::FileMetadata;
++use std::io;
++use std::io::Write;
++use std::path::Path;
++use std::path::PathBuf;
++use std::time::SystemTime;
++use std::time::UNIX_EPOCH;
++
++fn reject_symlink(path: &Path) -> io::Result<std::fs::Metadata> {
++    let metadata = std::fs::symlink_metadata(path)?;
++    if metadata.file_type().is_symlink() {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidInput,
++            "path contains a symbolic link",
++        ));
++    }
++    Ok(metadata)
++}
++
++fn ms(time: io::Result<SystemTime>) -> i64 {
++    time.ok()
++        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
++        .and_then(|d| i64::try_from(d.as_millis()).ok())
++        .unwrap_or(0)
++}
++
++pub(super) fn open_file_sync(path: &Path) -> io::Result<std::fs::File> {
++    let metadata = reject_symlink(path)?;
++    if !metadata.is_file() {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidInput,
++            "path is not a regular file",
++        ));
++    }
++    std::fs::File::open(path)
++}
++
++pub(super) async fn write_file(path: PathBuf, contents: Vec<u8>) -> io::Result<()> {
++    match std::fs::symlink_metadata(&path) {
++        Ok(metadata) if metadata.file_type().is_symlink() => {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                "path contains a symbolic link",
++            ));
++        }
++        Ok(metadata) if !metadata.is_file() => {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                "path is not a regular file",
++            ));
++        }
++        _ => {}
++    }
++    let mut file = std::fs::File::create(&path)?;
++    file.write_all(&contents)
++}
++
++pub(super) async fn metadata(path: PathBuf) -> io::Result<FileMetadata> {
++    let metadata = std::fs::symlink_metadata(&path)?;
++    Ok(FileMetadata {
++        is_directory: metadata.is_dir(),
++        is_file: metadata.is_file(),
++        is_symlink: metadata.file_type().is_symlink(),
++        size: metadata.len(),
++        created_at_ms: ms(metadata.created()),
++        modified_at_ms: ms(metadata.modified()),
++    })
++}
++
++pub(super) async fn create_directory(path: PathBuf, recursive: bool) -> io::Result<()> {
++    if recursive {
++        std::fs::create_dir_all(path)
++    } else {
++        std::fs::create_dir(path)
++    }
++}
++
++pub(super) async fn remove(path: PathBuf, recursive: bool, force: bool) -> io::Result<()> {
++    if recursive {
++        return Err(io::Error::new(
++            io::ErrorKind::Unsupported,
++            "recursive no-follow removal is unsupported",
++        ));
++    }
++    let metadata = match std::fs::symlink_metadata(&path) {
++        Ok(metadata) => metadata,
++        Err(error) if force && error.kind() == io::ErrorKind::NotFound => return Ok(()),
++        Err(error) => return Err(error),
++    };
++    if metadata.file_type().is_symlink() {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidInput,
++            "path contains a symbolic link",
++        ));
++    }
++    if metadata.is_dir() {
++        std::fs::remove_dir(path)
++    } else {
++        std::fs::remove_file(path)
++    }
++}
+diff --git a/codex-rs/exec-server/src/sandboxed_file_open.rs b/codex-rs/exec-server/src/sandboxed_file_open.rs
+index bf21a065cc..96049a2fb9 100644
+--- a/codex-rs/exec-server/src/sandboxed_file_open.rs
++++ b/codex-rs/exec-server/src/sandboxed_file_open.rs
+@@ -44,6 +44,18 @@ fn open_response(response: &[u8]) -> Result<FsHelperOpenResponse, JSONRPCErrorEr
+     }
+ }
+ 
++// agentOS wasm32-wasip1: no helper processes with fd passing; the VM is the sandbox,
++// so sandboxed opens are refused and callers fall back to direct filesystem access.
++#[cfg(target_os = "wasi")]
++async fn open_platform(
++    _command: SandboxExecRequest,
++    _request: Vec<u8>,
++) -> Result<tokio::fs::File, JSONRPCErrorError> {
++    Err(internal_error(
++        "sandboxed file open is unavailable on wasm32-wasip1".to_string(),
++    ))
++}
++
+ // Unix passes the opened fd over the helper's stdin socket.
+ #[cfg(unix)]
+ async fn open_platform(
+diff --git a/codex-rs/git-utils/src/lib.rs b/codex-rs/git-utils/src/lib.rs
+index 1224d2ab03..18be48a938 100644
+--- a/codex-rs/git-utils/src/lib.rs
++++ b/codex-rs/git-utils/src/lib.rs
+@@ -1,3 +1,4 @@
++#![cfg_attr(target_os = "wasi", feature(wasi_ext))]
+ mod apply;
+ mod baseline;
+ mod branch;
+diff --git a/codex-rs/git-utils/src/platform.rs b/codex-rs/git-utils/src/platform.rs
+index 41d4e2eae8..8a4aa9b1dd 100644
+--- a/codex-rs/git-utils/src/platform.rs
++++ b/codex-rs/git-utils/src/platform.rs
+@@ -33,5 +33,16 @@ pub fn create_symlink(
+     Ok(())
+ }
+ 
+-#[cfg(not(any(unix, windows)))]
++// agentOS wasm32-wasip1: WASI has path_symlink (the VM backs it).
++#[cfg(target_os = "wasi")]
++pub fn create_symlink(
++    _source: &Path,
++    link_target: &Path,
++    destination: &Path,
++) -> Result<(), GitToolingError> {
++    std::os::wasi::fs::symlink_path(link_target, destination)?;
++    Ok(())
++}
++
++#[cfg(not(any(unix, windows, target_os = "wasi")))]
+ compile_error!("codex-git symlink support is only implemented for Unix and Windows");
+diff --git a/codex-rs/rmcp-client/src/program_resolver.rs b/codex-rs/rmcp-client/src/program_resolver.rs
+index 7f15fe84ef..d851eb398c 100644
+--- a/codex-rs/rmcp-client/src/program_resolver.rs
++++ b/codex-rs/rmcp-client/src/program_resolver.rs
+@@ -19,7 +19,7 @@ use std::path::Path;
+ /// Unix systems handle PATH resolution and script execution natively through
+ /// the kernel's shebang (`#!`) mechanism, so this function simply returns
+ /// the program name unchanged.
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ pub fn resolve(
+     program: OsString,
+     _env: &HashMap<OsString, OsString>,
+diff --git a/codex-rs/rmcp-client/src/utils.rs b/codex-rs/rmcp-client/src/utils.rs
+index dac42ca611..83860bbb3f 100644
+--- a/codex-rs/rmcp-client/src/utils.rs
++++ b/codex-rs/rmcp-client/src/utils.rs
+@@ -159,7 +159,7 @@ pub(crate) fn build_default_headers(
+     Ok(headers)
+ }
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ pub(crate) const DEFAULT_ENV_VARS: &[&str] = &[
+     "HOME",
+     "LOGNAME",
+diff --git a/codex-rs/state/src/lib.rs b/codex-rs/state/src/lib.rs
+index d1de678a86..5884d8d72e 100644
+--- a/codex-rs/state/src/lib.rs
++++ b/codex-rs/state/src/lib.rs
+@@ -3,6 +3,7 @@
+ //! This crate is intentionally small and focused: it extracts rollout metadata
+ //! from JSONL rollouts and mirrors it into a local SQLite database. Backfill
+ //! orchestration and rollout scanning live in `codex-core`.
++#![cfg_attr(target_os = "wasi", feature(wasi_ext))]
+ 
+ const _: () = assert!(
+     libsqlite3_sys::SQLITE_VERSION_NUMBER >= 3_051_003,
+diff --git a/codex-rs/state/src/sqlite/validation.rs b/codex-rs/state/src/sqlite/validation.rs
+index f606d80f00..6fab6073e8 100644
+--- a/codex-rs/state/src/sqlite/validation.rs
++++ b/codex-rs/state/src/sqlite/validation.rs
+@@ -36,7 +36,15 @@ impl SqliteQuickCheckManager {
+         path: &Path,
+         budget: Duration,
+     ) -> anyhow::Result<QuickCheckOutcome> {
++        #[cfg(not(target_os = "wasi"))]
+         let id = file_id::get_file_id(path)?;
++        // agentOS wasm32-wasip1: file-id has no WASI arm; use dev/ino directly.
++        #[cfg(target_os = "wasi")]
++        let id = {
++            use std::os::wasi::fs::MetadataExt;
++            let metadata = std::fs::metadata(path)?;
++            FileId::new_inode(metadata.dev(), metadata.ino())
++        };
+ 
+         if !self.0.lock().await.insert(id) {
+             // Only check each file once for this owner.
+diff --git a/codex-rs/uds/src/lib.rs b/codex-rs/uds/src/lib.rs
+index 5fecf770be..c8dcf11a95 100644
+--- a/codex-rs/uds/src/lib.rs
++++ b/codex-rs/uds/src/lib.rs
+@@ -98,6 +98,69 @@ impl AsyncWrite for UnixStream {
+     }
+ }
+ 
++// agentOS wasm32-wasip1: no Unix domain sockets in WASI preview 1.
++#[cfg(target_os = "wasi")]
++mod platform {
++    use std::io;
++    use std::io::Result as IoResult;
++    use std::path::Path;
++    use std::pin::Pin;
++    use std::task::Context;
++    use std::task::Poll;
++
++    use tokio::io::AsyncRead;
++    use tokio::io::AsyncWrite;
++    use tokio::io::ReadBuf;
++
++    fn unsupported() -> io::Error {
++        io::Error::new(io::ErrorKind::Unsupported, "unix sockets are unavailable on wasm32-wasip1")
++    }
++
++    pub(super) async fn prepare_private_socket_directory(socket_dir: &Path) -> IoResult<()> {
++        tokio::fs::create_dir_all(socket_dir).await
++    }
++
++    pub(super) async fn is_stale_socket_path(socket_path: &Path) -> IoResult<bool> {
++        Ok(tokio::fs::try_exists(socket_path).await.unwrap_or(false))
++    }
++
++    pub(super) struct Listener;
++
++    impl Listener {
++        pub(super) async fn accept(&mut self) -> IoResult<Stream> {
++            Err(unsupported())
++        }
++    }
++
++    pub(super) struct Stream;
++
++    pub(super) async fn bind_listener(_socket_path: &Path) -> IoResult<Listener> {
++        Err(unsupported())
++    }
++
++    pub(super) async fn connect_stream(_socket_path: &Path) -> IoResult<Stream> {
++        Err(unsupported())
++    }
++
++    impl AsyncRead for Stream {
++        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<IoResult<()>> {
++            Poll::Ready(Err(unsupported()))
++        }
++    }
++
++    impl AsyncWrite for Stream {
++        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<IoResult<usize>> {
++            Poll::Ready(Err(unsupported()))
++        }
++        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<IoResult<()>> {
++            Poll::Ready(Ok(()))
++        }
++        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<IoResult<()>> {
++            Poll::Ready(Ok(()))
++        }
++    }
++}
++
+ #[cfg(unix)]
+ mod platform {
+     use std::io;
+diff --git a/codex-rs/utils/path-uri/src/lib.rs b/codex-rs/utils/path-uri/src/lib.rs
+index 7a42363dd1..7abfaf14b8 100644
+--- a/codex-rs/utils/path-uri/src/lib.rs
++++ b/codex-rs/utils/path-uri/src/lib.rs
+@@ -125,9 +125,12 @@ impl PathUri {
+             return uri;
+         }
+ 
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "wasi"))]
+         let path_bytes = {
++            #[cfg(unix)]
+             use std::os::unix::ffi::OsStrExt;
++            #[cfg(target_os = "wasi")]
++            use std::os::wasi::ffi::OsStrExt;
+             path.as_path().as_os_str().as_bytes().to_vec()
+         };
+         #[cfg(windows)]
+@@ -575,9 +578,12 @@ impl PathUri {
+             ));
+         }
+         if let Some(path_bytes) = decode_bad_path_uri(&self.0) {
+-            #[cfg(unix)]
++            #[cfg(any(unix, target_os = "wasi"))]
+             let decoded_path = {
++                #[cfg(unix)]
+                 use std::os::unix::ffi::OsStringExt;
++                #[cfg(target_os = "wasi")]
++                use std::os::wasi::ffi::OsStringExt;
+                 Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+                     path_bytes,
+                 )))
+@@ -1003,7 +1009,7 @@ impl PathConvention {
+     }
+ 
+     /// Returns the path convention used by the current process.
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     pub const fn native() -> Self {
+         Self::Posix
+     }
+diff --git a/codex-rs/utils/path-uri/src/platform.rs b/codex-rs/utils/path-uri/src/platform.rs
+index 90cb64efc8..57c2d8c03e 100644
+--- a/codex-rs/utils/path-uri/src/platform.rs
++++ b/codex-rs/utils/path-uri/src/platform.rs
+@@ -25,7 +25,8 @@ impl Platform {
+ 
+     /// Return the platform of the current process.
+     pub const fn native() -> Self {
+-        if cfg!(target_os = "linux") {
++        // agentOS: the wasm32-wasip1 VM presents a Linux userland.
++        if cfg!(any(target_os = "linux", target_os = "wasi")) {
+             Self::Linux
+         } else if cfg!(target_os = "macos") {
+             Self::Macos
+diff --git a/codex-rs/utils/path-utils/src/system_commands.rs b/codex-rs/utils/path-utils/src/system_commands.rs
+index 7e51da40aa..8f55b3d171 100644
+--- a/codex-rs/utils/path-utils/src/system_commands.rs
++++ b/codex-rs/utils/path-utils/src/system_commands.rs
+@@ -52,7 +52,7 @@ fn executable_in_directories(name: &str, directories: &[PathBuf]) -> Option<Path
+     })
+ }
+ 
+-#[cfg(unix)]
++#[cfg(any(unix, target_os = "wasi"))]
+ fn installation_roots() -> Vec<PathBuf> {
+     [
+         "/usr/bin",
+@@ -73,7 +73,7 @@ fn installation_roots() -> Vec<PathBuf> {
+ }
+ 
+ fn system_directories() -> Vec<PathBuf> {
+-    #[cfg(unix)]
++    #[cfg(any(unix, target_os = "wasi"))]
+     let directories = [
+         "/opt/homebrew/bin",
+         "/usr/local/bin",

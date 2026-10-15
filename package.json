@@ -1,0 +1,16 @@
+{
+  "name": "agentos-codex-lab",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@rivet-dev/agentos-core": "^0.4.1",
+    "tsx": "^4.23.15"
+  },
+  "scripts": {
+    "postinstall": "node scripts/patch-agentos.mjs",
+    "probe": "tsx probe.ts"
+  },
+  "devDependencies": {
+    "@rivet-dev/agentos-toolchain": "^0.4.1"
+  }
+}

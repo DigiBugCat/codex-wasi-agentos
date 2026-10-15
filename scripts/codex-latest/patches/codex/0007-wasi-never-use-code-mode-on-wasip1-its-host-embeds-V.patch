@@ -1,0 +1,57 @@
+From 1058f2642f2b4cb4122a48a5025a459ade07524e Mon Sep 17 00:00:00 2001
+From: agentos-lab <lab@local>
+Date: Thu, 15 Oct 2026 01:02:30 -0700
+Subject: [PATCH 7/9] wasi: never use code mode on wasip1 (its host embeds V8);
+ dispatch the fs helper
+
+---
+ codex-rs/core/src/tools/mod.rs | 5 +++++
+ codex-rs/exec/src/lib.rs       | 3 +++
+ codex-rs/features/src/lib.rs   | 4 +++-
+ 3 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/codex-rs/core/src/tools/mod.rs b/codex-rs/core/src/tools/mod.rs
+index 7523d8b6ec..a4940c195d 100644
+--- a/codex-rs/core/src/tools/mod.rs
++++ b/codex-rs/core/src/tools/mod.rs
+@@ -74,6 +74,11 @@ pub(crate) fn requested_tool_mode(turn_context: &TurnContext, model_info: &Model
+ }
+ 
+ pub(crate) fn effective_tool_mode(turn_context: &TurnContext, model_info: &ModelInfo) -> ToolMode {
++    // wasm32-wasip1 (agentOS): no code-mode runtime (V8) exists, so never offer code-mode
++    // tools, even when the model catalog requests code_mode / code_mode_only.
++    if cfg!(target_os = "wasi") {
++        return ToolMode::Direct;
++    }
+     let requested_tool_mode = requested_tool_mode(turn_context, model_info);
+     if !turn_context.code_mode_available
+         && requested_tool_mode == ToolMode::CodeMode
+diff --git a/codex-rs/exec/src/lib.rs b/codex-rs/exec/src/lib.rs
+index 8322600e77..190c4b4046 100644
+--- a/codex-rs/exec/src/lib.rs
++++ b/codex-rs/exec/src/lib.rs
+@@ -2469,6 +2469,9 @@ pub fn wasi_main() -> anyhow::Result<()> {
+                 .is_ok();
+             std::process::exit(if ok { 0 } else { 1 });
+         }
++        Some(arg) if arg == codex_exec_server::CODEX_FS_HELPER_ARG1 => {
++            codex_exec_server::run_fs_helper_main()
++        }
+         _ => wasi_native_main(),
+     }
+ }
+diff --git a/codex-rs/features/src/lib.rs b/codex-rs/features/src/lib.rs
+index 4030e8e4a6..a09ad53f03 100644
+--- a/codex-rs/features/src/lib.rs
++++ b/codex-rs/features/src/lib.rs
+@@ -1180,7 +1180,9 @@ pub const FEATURES: &[FeatureSpec] = &[
+         id: Feature::CodeModeHost,
+         key: "code_mode_host",
+         stage: Stage::Stable,
+-        default_enabled: true,
++        // wasm32-wasip1 (agentOS): the code-mode host embeds V8 and cannot be built for
++        // WASI, so there is no `codex-code-mode-host` to spawn.
++        default_enabled: !cfg!(target_os = "wasi"),
+     },
+     FeatureSpec {
+         id: Feature::CodeModeHostGrpc,

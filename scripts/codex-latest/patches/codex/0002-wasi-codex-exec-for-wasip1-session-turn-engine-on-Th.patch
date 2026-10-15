@@ -1,0 +1,682 @@
+From d704697b4d42ad88dca71e2a93f9dd1daaffd953 Mon Sep 17 00:00:00 2001
+From: agentos-lab <lab@local>
+Date: Thu, 15 Oct 2026 00:49:17 -0700
+Subject: [PATCH 2/9] wasi: codex-exec for wasip1: --session-turn engine on
+ ThreadManager + codex exec CLI
+
+---
+ codex-rs/app-server/src/lib.rs         |   7 +
+ codex-rs/exec/Cargo.toml               |  16 +-
+ codex-rs/exec/src/lib.rs               |  75 ++++
+ codex-rs/exec/src/main.rs              |   5 +
+ codex-rs/exec/src/session_turn_wasi.rs | 478 +++++++++++++++++++++++++
+ codex-rs/lmstudio/src/client.rs        |   4 +-
+ 6 files changed, 582 insertions(+), 3 deletions(-)
+ create mode 100644 codex-rs/exec/src/session_turn_wasi.rs
+
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+index 9ef1b73a82..686c47d7c6 100644
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -216,6 +216,13 @@ enum ShutdownSignal {
+ }
+ 
+ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
++    // wasm32-wasip1 (agentOS): no OS signals; shutdown comes from the client.
++    #[cfg(target_os = "wasi")]
++    {
++        std::future::pending::<()>().await;
++        Ok(ShutdownSignal::Forceable)
++    }
++
+     #[cfg(unix)]
+     {
+         use tokio::signal::unix::SignalKind;
+diff --git a/codex-rs/exec/Cargo.toml b/codex-rs/exec/Cargo.toml
+index d5190c2caa..37de872609 100644
+--- a/codex-rs/exec/Cargo.toml
++++ b/codex-rs/exec/Cargo.toml
+@@ -65,8 +65,22 @@ ts-rs = { workspace = true, features = [
+ ] }
+ uuid = { workspace = true }
+ 
++# wasm32-wasip1 (agentOS): extra deps for the `--session-turn` engine, which drives
++# ThreadManager through codex-core-api directly (no in-process app-server).
++[target.'cfg(target_os = "wasi")'.dependencies]
++codex-apply-patch = { workspace = true }
++codex-core-api = { workspace = true }
++codex-exec-server = { workspace = true }
++codex-history = { workspace = true }
++codex-protocol = { workspace = true }
++codex-utils-absolute-path = { workspace = true }
++serde_json = { workspace = true }
++tokio = { workspace = true, features = ["rt", "macros", "io-util", "io-std", "sync", "time"] }
++toml = { workspace = true }
++tracing = { workspace = true }
++tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
+ 
+-[dev-dependencies]
++[target.'cfg(not(target_os = "wasi"))'.dev-dependencies]
+ assert_cmd = { workspace = true }
+ codex-apply-patch = { workspace = true }
+ codex-utils-cargo-bin = { workspace = true }
+diff --git a/codex-rs/exec/src/lib.rs b/codex-rs/exec/src/lib.rs
+index 8d3fcd8861..8322600e77 100644
+--- a/codex-rs/exec/src/lib.rs
++++ b/codex-rs/exec/src/lib.rs
+@@ -1184,10 +1184,17 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
+ 
+     let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
+     tokio::spawn(async move {
++        #[cfg(not(target_os = "wasi"))]
+         if tokio::signal::ctrl_c().await.is_ok() {
+             tracing::debug!("Keyboard interrupt");
+             let _ = interrupt_tx.send(());
+         }
++        // wasm32-wasip1 (agentOS): no signals; keep the sender alive.
++        #[cfg(target_os = "wasi")]
++        {
++            std::future::pending::<()>().await;
++            drop(interrupt_tx);
++        }
+     });
+ 
+     let task_id = match initial_operation {
+@@ -2428,6 +2435,74 @@ fn build_review_request(args: &ReviewArgs) -> anyhow::Result<ReviewRequest> {
+     })
+ }
+ 
++// ---- wasm32-wasip1 (agentOS) -------------------------------------------------
++// `--session-turn` runs the agentOS NDJSON engine; the apply-patch self-invocation is
++// handled here; any other invocation runs the normal `codex exec` CLI above on a
++// current-thread runtime (no codex-arg0 worker thread / current_exe on wasip1).
++
++#[cfg(target_os = "wasi")]
++mod session_turn_wasi;
++
++#[cfg(target_os = "wasi")]
++pub fn wasi_main() -> anyhow::Result<()> {
++    let args: Vec<String> = std::env::args().collect();
++    match args.get(1).map(String::as_str) {
++        Some("--session-turn") => session_turn_wasi::run(),
++        // Same contract as codex-arg0's apply-patch self-invocation.
++        Some(arg) if arg == codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1 => {
++            let patch = args.get(2).map(String::as_str).unwrap_or_default();
++            let mut stdout = std::io::stdout();
++            let mut stderr = std::io::stderr();
++            let cwd = codex_utils_absolute_path::AbsolutePathBuf::current_dir()?.into();
++            let runtime = tokio::runtime::Builder::new_current_thread()
++                .enable_time()
++                .build()?;
++            let ok = runtime
++                .block_on(codex_apply_patch::apply_patch(
++                    patch,
++                    &cwd,
++                    &mut stdout,
++                    &mut stderr,
++                    codex_exec_server::LOCAL_FS.as_ref(),
++                    /*sandbox*/ None,
++                ))
++                .is_ok();
++            std::process::exit(if ok { 0 } else { 1 });
++        }
++        _ => wasi_native_main(),
++    }
++}
++
++/// `codex exec ...` without codex-arg0's dispatcher, which needs a worker thread
++/// and `current_exe()` (neither exists on wasip1).
++#[cfg(target_os = "wasi")]
++fn wasi_native_main() -> anyhow::Result<()> {
++    use clap::Parser;
++
++    #[derive(Parser, Debug)]
++    struct TopCli {
++        #[clap(flatten)]
++        config_overrides: codex_utils_cli::CliConfigOverrides,
++
++        #[clap(flatten)]
++        inner: Cli,
++    }
++
++    let top_cli = TopCli::parse();
++    let mut inner = top_cli.inner;
++    inner
++        .config_overrides
++        .prepend_root_overrides(top_cli.config_overrides);
++    let paths = codex_arg0::Arg0DispatchPaths {
++        codex_self_exe: Some(session_turn_wasi::resolve_self_exe()),
++        ..Default::default()
++    };
++    tokio::runtime::Builder::new_current_thread()
++        .enable_time()
++        .build()?
++        .block_on(run_main(inner, paths))
++}
++
+ #[cfg(test)]
+ #[path = "lib_tests.rs"]
+ mod tests;
+diff --git a/codex-rs/exec/src/main.rs b/codex-rs/exec/src/main.rs
+index 69d432acc0..6e93e7f948 100644
+--- a/codex-rs/exec/src/main.rs
++++ b/codex-rs/exec/src/main.rs
+@@ -29,7 +29,12 @@ struct TopCli {
+     inner: Cli,
+ }
+ 
++#[cfg_attr(target_os = "wasi", allow(unreachable_code))]
+ fn main() -> anyhow::Result<()> {
++    // wasm32-wasip1 (agentOS): `--session-turn`, apply-patch and `codex exec` dispatch.
++    #[cfg(target_os = "wasi")]
++    return codex_exec::wasi_main();
++
+     arg0_dispatch_or_else(|arg0_paths: Arg0DispatchPaths| async move {
+         let top_cli = TopCli::parse();
+         // Merge root-level overrides into inner CLI struct so downstream logic remains unchanged.
+diff --git a/codex-rs/exec/src/session_turn_wasi.rs b/codex-rs/exec/src/session_turn_wasi.rs
+new file mode 100644
+index 0000000000..5479009b12
+--- /dev/null
++++ b/codex-rs/exec/src/session_turn_wasi.rs
+@@ -0,0 +1,478 @@
++//! wasm32-wasip1 session-turn engine (agentOS).
++//!
++//! Re-port of rivet-dev/codex `exec/src/session_turn_wasi.rs` (fork pin 8f4655a9 plus
++//! agentOS patches 0001-0011) onto upstream ThreadManager. It drives the real
++//! codex-core agent and speaks the newline-JSON protocol that agentOS's codex
++//! adapter (and agentos-lab's codex-turn.ts / codex-mock-turn.ts) expect from
++//! `codex-exec --session-turn`:
++//!   stdin:  {type:"start", cwd, model, prompt, reasoning_effort?, history?} then
++//!           {type:"permission_response", decision} after each permission_request
++//!   stdout: {type:"start"} / {type:"text_delta",delta} / {type:"reasoning_delta",delta} /
++//!           {type:"tool_call_update",tool_call_id,status,...} /
++//!           {type:"permission_request",tool_call_id,...} / {type:"done"} /
++//!           {type:"error",message}
++
++use std::collections::HashMap;
++use std::collections::HashSet;
++use std::io::Write;
++use std::sync::Arc;
++
++use anyhow::Context as _;
++use codex_core_api::AuthManager;
++use codex_core_api::CodexAppsToolsCache;
++use codex_core_api::CodexHomeUserInstructionsProvider;
++use codex_core_api::Config;
++use codex_core_api::EnvironmentManager;
++use codex_core_api::EventMsg;
++use codex_core_api::ExecServerRuntimeOptions;
++use codex_core_api::ExtensionRegistryBuilder;
++use codex_core_api::InitialHistory;
++use codex_history::RolloutItem;
++use codex_core_api::Op;
++use codex_core_api::SessionSource;
++use codex_core_api::StartIfIdleSubmission;
++use codex_core_api::StartThreadOptions;
++use codex_core_api::ThreadManager;
++use codex_core_api::TurnInputRequest;
++use codex_core_api::UserInput;
++use codex_core_api::build_models_manager;
++use codex_core_api::passthrough_image_store;
++use codex_core_api::resolve_installation_id;
++use codex_core_api::thread_store_from_config;
++use codex_protocol::items::AgentMessageContent;
++use codex_protocol::items::TurnItem;
++use codex_protocol::models::MessagePhase;
++use codex_protocol::protocol::ExecOutputStream;
++use codex_protocol::protocol::ReviewDecision;
++use serde_json::Value;
++use serde_json::json;
++
++/// Map the protocol `history` array (`[{ "role": "user"|"assistant", "content": "..." }]`)
++/// into rollout items for `InitialHistory::Forked`, so a multi-turn session replays prior
++/// context. Each `--session-turn` process is stateless; the adapter sends the full prior
++/// transcript. Items are built through serde so this stays independent of struct layout.
++fn history_from_start(start: &Value) -> Vec<RolloutItem> {
++    let Some(entries) = start.get("history").and_then(Value::as_array) else {
++        return Vec::new();
++    };
++    entries
++        .iter()
++        .filter_map(|entry| {
++            let role = entry.get("role").and_then(Value::as_str).unwrap_or("user");
++            let text = entry.get("content").and_then(Value::as_str).unwrap_or("");
++            if text.is_empty() {
++                return None;
++            }
++            let (role, kind) = if role == "assistant" {
++                ("assistant", "output_text")
++            } else {
++                ("user", "input_text")
++            };
++            serde_json::from_value::<RolloutItem>(json!({
++                "type": "response_item",
++                "payload": {
++                    "type": "message",
++                    "role": role,
++                    "content": [{ "type": kind, "text": text }],
++                },
++            }))
++            .ok()
++        })
++        .collect()
++}
++
++pub(crate) fn resolve_self_exe() -> std::path::PathBuf {
++    if let Some(path) = std::env::var_os("CODEX_SELF_EXE") {
++        return path.into();
++    }
++    let name = std::env::args()
++        .next()
++        .and_then(|a| std::path::Path::new(&a).file_name().map(|n| n.to_owned()))
++        .unwrap_or_else(|| "codex-exec".into());
++    if let Some(paths) = std::env::var_os("PATH") {
++        for dir in std::env::split_paths(&paths) {
++            let candidate = dir.join(&name);
++            if candidate.is_file() {
++                return candidate;
++            }
++        }
++    }
++    std::path::PathBuf::from("/opt/agentos/bin").join(name)
++}
++
++fn emit(v: Value) {
++    let mut out = std::io::stdout();
++    let _ = writeln!(out, "{v}");
++    let _ = out.flush();
++}
++
++fn read_line() -> Option<String> {
++    let mut s = String::new();
++    match std::io::stdin().read_line(&mut s) {
++        Ok(0) | Err(_) => None,
++        Ok(_) => Some(s),
++    }
++}
++
++fn read_decision() -> ReviewDecision {
++    let resp = read_line().unwrap_or_default();
++    let resp: Value = serde_json::from_str(resp.trim()).unwrap_or_else(|_| json!({}));
++    match resp["decision"].as_str() {
++        Some("allow") | Some("approve") | Some("allow_always") => ReviewDecision::Approved,
++        _ => ReviewDecision::Denied {
++            rejection: "denied by the agentOS session host".to_string(),
++        },
++    }
++}
++
++pub fn run() -> anyhow::Result<()> {
++    // Surface codex-core tracing on stderr (RUST_LOG-gated) for in-VM diagnosis.
++    let _ = tracing_subscriber::fmt()
++        .with_writer(std::io::stderr)
++        .with_env_filter(
++            tracing_subscriber::EnvFilter::try_from_default_env()
++                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error")),
++        )
++        .try_init();
++    // wasm32-wasip1 is single-threaded with no tokio I/O reactor. codex-core runs the turn
++    // on internally spawned tasks, so a current-thread runtime with only the time driver
++    // is used; network I/O is host-brokered and synchronous from the guest's view.
++    let rt = tokio::runtime::Builder::new_current_thread()
++        .enable_time()
++        .build()?;
++    let result = rt.block_on(session_turn());
++    if let Err(err) = &result {
++        emit(json!({ "type": "error", "message": format!("{err:#}") }));
++    }
++    result
++}
++
++async fn session_turn() -> anyhow::Result<()> {
++    let start_raw = read_line().context("no start message on stdin")?;
++    let start: Value = serde_json::from_str(start_raw.trim()).context("bad start json")?;
++    let model = start["model"].as_str().unwrap_or("gpt-5").to_string();
++    let reasoning_effort = start["reasoning_effort"]
++        .as_str()
++        .unwrap_or("medium")
++        .to_string();
++    let cwd = start["cwd"].as_str().unwrap_or(".").to_string();
++    let prompt = start["prompt"].as_str().unwrap_or("").to_string();
++
++    emit(json!({ "type": "start" }));
++
++    // Compatibility with the July engine's environment contract: upstream Codex no
++    // longer reads OPENAI_API_KEY / OPENAI_BASE_URL for model requests (it reads
++    // CODEX_API_KEY and the `openai_base_url` config key). Map them here.
++    if std::env::var_os("CODEX_API_KEY").is_none()
++        && let Some(key) = std::env::var_os("OPENAI_API_KEY")
++    {
++        // SAFETY: single-threaded wasip1 process; no other threads read the env.
++        unsafe { std::env::set_var("CODEX_API_KEY", key) };
++    }
++    let mut overrides = vec![
++        ("model".to_string(), toml::Value::String(model)),
++        (
++            "model_reasoning_effort".to_string(),
++            toml::Value::String(reasoning_effort),
++        ),
++        (
++            "approval_policy".to_string(),
++            toml::Value::String("on-request".to_string()),
++        ),
++        (
++            "features.shell_snapshot".to_string(),
++            toml::Value::Boolean(false),
++        ),
++        (
++            "sandbox_mode".to_string(),
++            toml::Value::String("workspace-write".to_string()),
++        ),
++        // The VM has no persistent rollout/sqlite state worth keeping.
++        ("ephemeral".to_string(), toml::Value::Boolean(true)),
++    ];
++    if let Ok(base_url) = std::env::var("OPENAI_BASE_URL")
++        && !base_url.is_empty()
++    {
++        overrides.push(("openai_base_url".to_string(), toml::Value::String(base_url)));
++    }
++    // agentOS patch 0001: start from this revision's defaults (no host config.toml), so a
++    // newer/older CLI's settings can't be rejected. CODEX_HOME is still used for auth.
++    let mut config = Config::load_default_with_cli_overrides(overrides)
++        .await
++        .context("load config")?;
++    std::env::set_current_dir(&cwd).ok();
++    if let Ok(abs) = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path_checked(
++        std::path::PathBuf::from(&cwd),
++    ) {
++        config.cwd = abs.clone();
++        config.workspace_roots = vec![abs];
++    }
++    // std::env::current_exe() is unsupported on wasip1; tool runtimes re-exec this binary
++    // (e.g. apply_patch), so resolve it from CODEX_SELF_EXE, then PATH.
++    if config.codex_self_exe.is_none() {
++        config.codex_self_exe = Some(resolve_self_exe());
++    }
++    // No tokio::net reactor on wasip1: the WebSocket transport cannot connect. Force the
++    // HTTP Responses transport (host-brokered via wasi-http) on every provider.
++    for provider in config.model_providers.values_mut() {
++        provider.supports_websockets = false;
++    }
++    config.model_provider.supports_websockets = false;
++
++    let auth_manager =
++        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ true).await?;
++    let local_runtime_paths = ExecServerRuntimeOptions::from_optional_paths(
++        config.codex_self_exe.clone(),
++        config.codex_linux_sandbox_exe.clone(),
++    )?;
++    // The sqlite state DB is skipped on wasi (sqlx-sqlite needs threads).
++    let thread_store = thread_store_from_config(&config, None);
++    let environment_manager = Arc::new(
++        EnvironmentManager::from_codex_home(
++            config.codex_home.clone(),
++            Some(local_runtime_paths),
++            config.http_client_factory(),
++        )
++        .await?,
++    );
++    let installation_id = resolve_installation_id(&config.codex_home).await?;
++    let user_instructions_provider = Arc::new(CodexHomeUserInstructionsProvider::new(
++        config.codex_home.clone(),
++    ));
++    let extensions = ExtensionRegistryBuilder::<Config>::new();
++    let thread_manager = ThreadManager::new(
++        &config,
++        Arc::clone(&auth_manager),
++        build_models_manager(&config, Arc::clone(&auth_manager)),
++        CodexAppsToolsCache::default(),
++        SessionSource::Exec,
++        environment_manager,
++        Arc::new(extensions.build()),
++        user_instructions_provider,
++        /*analytics_events_client*/ None,
++        passthrough_image_store(),
++        Arc::clone(&thread_store),
++        /*agent_graph_store*/ None,
++        installation_id,
++        /*attestation_provider*/ None,
++        /*external_time_provider*/ None,
++    );
++
++    let history = history_from_start(&start);
++    let new_thread = if history.is_empty() {
++        thread_manager
++            .start_thread(StartThreadOptions::new(config.clone()))
++            .await
++            .context("start thread")?
++    } else {
++        thread_manager
++            .resume_thread_with_history(
++                config.clone(),
++                InitialHistory::Forked(history),
++                Arc::clone(&auth_manager),
++                /*parent_trace*/ None,
++                Default::default(),
++            )
++            .await
++            .context("resume thread with history")?
++    };
++    let thread = new_thread.thread;
++
++    let submission = thread
++        .start_turn_if_idle(TurnInputRequest::user_input(vec![UserInput::Text {
++            text: prompt,
++            text_elements: Vec::new(),
++        }]))
++        .await
++        .context("submit prompt")?;
++    if let StartIfIdleSubmission::NotSubmitted { reason } = submission {
++        anyhow::bail!("turn input was not submitted: {reason:?}");
++    }
++
++    // agentOS patch 0011: consume the canonical item lifecycle (not mirrored legacy
++    // events); stream final-answer items, project commentary as reasoning, and keep the
++    // last unphased item as the fallback answer.
++    let mut message_phases: HashMap<String, Option<MessagePhase>> = HashMap::new();
++    let mut streamed_items: HashSet<String> = HashSet::new();
++    let mut emitted_final_answer = false;
++    let mut fallback_message: Option<String> = None;
++    loop {
++        let event = thread.next_event().await.context("next_event")?;
++        match event.msg {
++            EventMsg::ItemStarted(e) => {
++                if let TurnItem::AgentMessage(item) = e.item {
++                    message_phases.insert(item.id, item.phase);
++                }
++            }
++            EventMsg::AgentMessageContentDelta(e) => {
++                match message_phases.get(&e.item_id).cloned().flatten() {
++                    Some(MessagePhase::Commentary) => {
++                        emit(json!({ "type": "reasoning_delta", "delta": e.delta }));
++                        streamed_items.insert(e.item_id);
++                    }
++                    Some(MessagePhase::FinalAnswer) => {
++                        emit(json!({ "type": "text_delta", "delta": e.delta }));
++                        streamed_items.insert(e.item_id);
++                        emitted_final_answer = true;
++                    }
++                    _ => {}
++                }
++            }
++            EventMsg::ItemCompleted(e) => {
++                if let TurnItem::AgentMessage(item) = e.item {
++                    let text = item
++                        .content
++                        .iter()
++                        .map(|content| match content {
++                            AgentMessageContent::Text { text } => text.as_str(),
++                        })
++                        .collect::<String>();
++                    let streamed = streamed_items.remove(&item.id);
++                    match item.phase {
++                        Some(MessagePhase::Commentary) if !streamed && !text.is_empty() => {
++                            emit(json!({ "type": "reasoning_delta", "delta": text }));
++                        }
++                        Some(MessagePhase::FinalAnswer) => {
++                            if !streamed && !text.is_empty() {
++                                emit(json!({ "type": "text_delta", "delta": text }));
++                            }
++                            emitted_final_answer = true;
++                        }
++                        None => fallback_message = Some(text),
++                        _ => {}
++                    }
++                    message_phases.remove(&item.id);
++                }
++            }
++            EventMsg::ExecCommandBegin(e) => {
++                emit(json!({
++                    "type": "tool_call_update",
++                    "tool_call_id": e.call_id,
++                    "kind": "execute",
++                    "title": "Shell",
++                    "command": e.command.join(" "),
++                    "status": "in_progress",
++                }));
++            }
++            EventMsg::ExecCommandOutputDelta(e) => {
++                let chunk = String::from_utf8_lossy(&e.chunk).into_owned();
++                let (stdout, stderr) = match e.stream {
++                    ExecOutputStream::Stderr => (String::new(), chunk),
++                    _ => (chunk, String::new()),
++                };
++                emit(json!({
++                    "type": "tool_call_update",
++                    "tool_call_id": e.call_id,
++                    "kind": "execute",
++                    "title": "Shell",
++                    "status": "in_progress",
++                    "stdout": stdout,
++                    "stderr": stderr,
++                }));
++            }
++            EventMsg::ExecCommandEnd(e) => {
++                emit(json!({
++                    "type": "tool_call_update",
++                    "tool_call_id": e.call_id,
++                    "kind": "execute",
++                    "title": "Shell",
++                    "command": e.command.join(" "),
++                    "status": if e.exit_code == 0 { "completed" } else { "failed" },
++                    "exit_code": e.exit_code,
++                    // Upstream folded stdout/stderr into aggregated_output.
++                    "stdout": e.aggregated_output,
++                    "stderr": "",
++                }));
++            }
++            EventMsg::ExecApprovalRequest(e) => {
++                let approval_id = e.effective_approval_id();
++                emit(json!({
++                    "type": "permission_request",
++                    "tool_call_id": e.call_id,
++                    "kind": "execute",
++                    "title": "Shell",
++                    "command": e.command.join(" "),
++                }));
++                let decision = read_decision();
++                let _ = thread
++                    .submit(Op::ExecApproval {
++                        id: approval_id,
++                        turn_id: Some(e.turn_id),
++                        decision,
++                    })
++                    .await;
++            }
++            EventMsg::ApplyPatchApprovalRequest(e) => {
++                emit(json!({
++                    "type": "permission_request",
++                    "tool_call_id": e.call_id,
++                    "kind": "edit",
++                    "title": "Apply patch",
++                    "locations": e.changes.keys().map(|path| json!({ "path": path })).collect::<Vec<_>>(),
++                }));
++                let decision = read_decision();
++                let _ = thread
++                    .submit(Op::PatchApproval {
++                        id: e.call_id,
++                        decision,
++                    })
++                    .await;
++            }
++            EventMsg::PatchApplyBegin(e) => {
++                emit(json!({
++                    "type": "tool_call_update",
++                    "tool_call_id": e.call_id,
++                    "kind": "edit",
++                    "title": "Apply patch",
++                    "status": "in_progress",
++                    "locations": e.changes.keys().map(|path| json!({ "path": path })).collect::<Vec<_>>(),
++                }));
++            }
++            EventMsg::PatchApplyEnd(e) => {
++                emit(json!({
++                    "type": "tool_call_update",
++                    "tool_call_id": e.call_id,
++                    "kind": "edit",
++                    "title": "Apply patch",
++                    "status": if e.success { "completed" } else { "failed" },
++                    "stdout": e.stdout,
++                    "stderr": e.stderr,
++                    "locations": e.changes.keys().map(|path| json!({ "path": path })).collect::<Vec<_>>(),
++                }));
++            }
++            EventMsg::TurnComplete(_) => {
++                if !emitted_final_answer
++                    && let Some(message) = fallback_message.take().filter(|t| !t.is_empty())
++                {
++                    emit(json!({ "type": "text_delta", "delta": message }));
++                }
++                emit(json!({ "type": "done" }));
++                break;
++            }
++            EventMsg::TurnAborted(e) => {
++                emit(json!({ "type": "error", "message": format!("turn aborted: {e:?}") }));
++                break;
++            }
++            EventMsg::Error(err) => {
++                emit(json!({ "type": "error", "message": err.message }));
++                break;
++            }
++            _ => {}
++        }
++    }
++    let _ = thread.shutdown_and_wait().await;
++    Ok(())
++}
++
++/// sqlx's bundled sqlite is built without extension loading, but the bindings still
++/// reference `sqlite3_load_extension`, leaving an unresolved `env` import the agentOS
++/// runtime doesn't provide. Codex never loads extensions; return SQLITE_ERROR.
++#[unsafe(no_mangle)]
++pub extern "C" fn sqlite3_load_extension(
++    _db: *mut core::ffi::c_void,
++    _z_file: *const core::ffi::c_char,
++    _z_proc: *const core::ffi::c_char,
++    _pz_err_msg: *mut *mut core::ffi::c_char,
++) -> core::ffi::c_int {
++    1
++}
+diff --git a/codex-rs/lmstudio/src/client.rs b/codex-rs/lmstudio/src/client.rs
+index 8b0a89a932..c0e5b7d2a9 100644
+--- a/codex-rs/lmstudio/src/client.rs
++++ b/codex-rs/lmstudio/src/client.rs
+@@ -143,7 +143,7 @@ impl LMStudioClient {
+         let home = match home_dir {
+             Some(dir) => dir.to_string(),
+             None => {
+-                #[cfg(unix)]
++                #[cfg(any(unix, target_os = "wasi"))]
+                 {
+                     std::env::var("HOME").unwrap_or_default()
+                 }
+@@ -154,7 +154,7 @@ impl LMStudioClient {
+             }
+         };
+ 
+-        #[cfg(unix)]
++        #[cfg(any(unix, target_os = "wasi"))]
+         let fallback_path = format!("{home}/.lmstudio/bin/lms");
+ 
+         #[cfg(windows)]
