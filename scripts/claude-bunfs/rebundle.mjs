@@ -23,6 +23,7 @@ for (const f of readdirSync(src, { recursive: true })) {
 }
 copyFileSync(new URL("./bun-shim.js", import.meta.url), join(stage, "bun-shim.js"));
 copyFileSync(new URL("./bun-ant.js", import.meta.url), join(stage, "bun-ant.js"));
+copyFileSync(new URL("./bun-file.js", import.meta.url), join(stage, "bun-file.js"));
 symlinkSync(nm, join(stage, "node_modules"));
 const r = await esbuild.build({
 	entryPoints: [join(stage, "cli.js")], bundle: true, splitting: true, format: "esm", platform: "node", target: "node22",
