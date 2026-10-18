@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { Readable } from "node:stream";
-import { readFileSync, existsSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { spawn as cpSpawn } from "node:child_process";
 const require = createRequire(import.meta.url);
@@ -16,6 +16,7 @@ const { default: sliceAnsi } = await import("slice-ansi");
 const { default: wrapAnsi } = await import("wrap-ansi");
 const { default: stripAnsi } = await import("strip-ansi");
 import { createBunAnt } from "./bun-ant.js";
+import { file } from "./bun-file.js";
 
 const CRC = new Uint32Array(256).map((_, n) => { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c >>> 0; });
 const crc32 = (b) => { b = typeof b === "string" ? Buffer.from(b) : b; let c = 0xffffffff; for (let i = 0; i < b.length; i++) c = CRC[(c ^ b[i]) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; };
@@ -44,11 +45,6 @@ const spawn = (cmdOrOpts, maybeOpts) => {
 		get exitCode() { return child.exitCode; },
 	};
 };
-const file = (p) => ({
-	name: String(p), text: async () => readFileSync(p, "utf8"), json: async () => JSON.parse(readFileSync(p, "utf8")),
-	arrayBuffer: async () => readFileSync(p).buffer, exists: async () => existsSync(p), get size() { try { return statSync(p).size; } catch { return 0; } },
-	write: async (d) => writeFileSync(p, d),
-});
 const missing = new Set();
 const Bun = new Proxy({
 	version: "1.3.0-node-shim", revision: "shim", main: process.argv[1], isStandaloneExecutable: false,
